@@ -1,7 +1,7 @@
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timedelta
 import csv
 import io
 import os
@@ -14,7 +14,7 @@ from sqlalchemy import (
     String,
     Boolean,
     DateTime,
-    Integer
+    Integer,
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
@@ -28,11 +28,10 @@ logger = logging.getLogger("air-quality-server")
 # DATABASE CONFIG
 # =========================================================
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set")
 
-# Fix postgres URL for SQLAlchemy
+# Fix Railway postgres URL
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace(
         "postgres://", "postgresql+psycopg://"
@@ -43,6 +42,7 @@ elif DATABASE_URL.startswith("postgresql://"):
     )
 
 MAX_RECORDS_PER_DEVICE = 1000
+DEVICE_ACTIVE_SECONDS = 15  # 👈 device considered active if last update ≤ 15s
 
 # =========================================================
 # SQLALCHEMY SETUP
@@ -87,15 +87,15 @@ class AirQuality(Base):
 # =========================================================
 app = FastAPI(
     title="Air Quality IoT Server",
-    description="ESP32 → FastAPI → PostgreSQL → CSV / ML",
-    version="1.0.0"
+    description="ESP32 → FastAPI → PostgreSQL → Flutter / CSV / ML",
+    version="1.1.0",
 )
 
 # =========================================================
-# STARTUP EVENT
+# STARTUP
 # =========================================================
 @app.on_event("startup")
-def on_startup():
+def startup():
     logger.info("Creating database tables (if not exist)")
     Base.metadata.create_all(bind=engine)
 
@@ -143,7 +143,7 @@ def compute_alerts(data: ESP32Data):
         co_alert,
         butane_alert,
         temperature_alert,
-        humidity_alert
+        humidity_alert,
     ])
 
     return alert, co_alert, butane_alert, temperature_alert, humidity_alert
@@ -169,9 +169,7 @@ def cleanup_old_records(db: Session, device_id: str):
             db.delete(row)
 
         db.commit()
-        logger.info(
-            f"Cleaned {len(to_delete)} old records for {device_id}"
-        )
+        logger.info(f"Deleted {len(to_delete)} old records for {device_id}")
 
 # =========================================================
 # ROUTES
@@ -179,7 +177,7 @@ def cleanup_old_records(db: Session, device_id: str):
 @app.post("/api/data")
 def receive_data(
     data: ESP32Data,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     timestamp = datetime.utcnow()
 
@@ -197,7 +195,7 @@ def receive_data(
         co_alert=co_alert,
         butane_alert=butane_alert,
         temperature_alert=temp_alert,
-        humidity_alert=hum_alert
+        humidity_alert=hum_alert,
     )
 
     db.add(record)
@@ -206,6 +204,35 @@ def receive_data(
     cleanup_old_records(db, data.device_id)
 
     return {"status": "ok"}
+
+
+@app.get("/api/devices/{device_id}")
+def get_device(device_id: str, db: Session = Depends(get_db)):
+    last = (
+        db.query(AirQuality)
+        .filter(AirQuality.device_id == device_id)
+        .order_by(AirQuality.timestamp.desc())
+        .first()
+    )
+
+    if not last:
+        raise HTTPException(status_code=404, detail="device_not_found")
+
+    now = datetime.utcnow()
+    diff = (now - last.timestamp).total_seconds()
+
+    return {
+        "device_id": device_id,
+        "active": diff <= DEVICE_ACTIVE_SECONDS,
+        "last_activity": last.timestamp.isoformat(),
+        "data": {
+            "temperature": last.temperature,
+            "humidity": last.humidity,
+            "co": last.co_ppm,
+            "h2": last.h2_ppm,
+            "butane": last.butane_ppm,
+        },
+    }
 
 
 @app.get("/latest")
@@ -227,7 +254,7 @@ def latest(db: Session = Depends(get_db)):
         "co_ppm": row.co_ppm,
         "h2_ppm": row.h2_ppm,
         "butane_ppm": row.butane_ppm,
-        "alert": row.alert
+        "alert": row.alert,
     }
 
 
@@ -250,7 +277,7 @@ def download_csv(db: Session = Depends(get_db)):
         "co_alert",
         "butane_alert",
         "temperature_alert",
-        "humidity_alert"
+        "humidity_alert",
     ])
 
     for r in rows:
@@ -266,7 +293,7 @@ def download_csv(db: Session = Depends(get_db)):
             r.co_alert,
             r.butane_alert,
             r.temperature_alert,
-            r.humidity_alert
+            r.humidity_alert,
         ])
 
     output.seek(0)
@@ -277,7 +304,7 @@ def download_csv(db: Session = Depends(get_db)):
         headers={
             "Content-Disposition":
             "attachment; filename=air_quality_data.csv"
-        }
+        },
     )
 
 
